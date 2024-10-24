@@ -1,15 +1,17 @@
 """Utility functions for the paper notebooks."""
+# pylint: disable=too-many-branches
 
 from __future__ import annotations
 
 import copy
 import json
 import logging
+import os
 import re
 import sys
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Dict, List, Set
+from typing import Any, Dict, List, Set, Tuple
 
 import numpy as np
 import pandas as pd
@@ -187,7 +189,13 @@ class MetadataHandler:
                 f"{len(diff_set)} md5sums in the results dataframe are not present in the metadata dataframe. Saved error md5sums to join_missing_md5sums.csv."
             )
 
-        merged_df = df.merge(metadata_df, how="left", left_index=True, right_index=True, suffixes=(None, "_delete"))
+        merged_df = df.merge(
+            metadata_df,
+            how="left",
+            left_index=True,
+            right_index=True,
+            suffixes=(None, "_delete"),
+        )
         if len(merged_df) != len(df):
             raise AssertionError(
                 "Merged dataframe has different length than original dataframe"
@@ -616,6 +624,179 @@ class SplitResultsHandler:
             for classifier_name, classifier_metrics in split_metrics.items():
                 new_metrics[classifier_name][split_name] = classifier_metrics
         return dict(new_metrics)
+
+    @staticmethod
+    def general_split_metrics(
+        results_dir: Path,
+        merge_assays: bool,
+        exclude_categories: List[str] | None = None,
+        exclude_names: List[str] | None = None,
+        return_type: str = "both",
+        mislabel_corrections: Tuple[Dict[str, str], Dict[str, Dict[str, str]]]
+        | None = None,
+        verbose: bool = False,
+    ) -> (
+        Dict[str, Dict[str, Dict[str, float]]]
+        | Dict[str, Dict[str, pd.DataFrame]]
+        | Tuple[
+            Dict[str, Dict[str, Dict[str, float]]], Dict[str, Dict[str, pd.DataFrame]]
+        ]
+    ):
+        """Create the content data for figure 2a. (get metrics for each task)
+
+        Currently only using oversampled runs.
+
+        Args:
+            results_dir (Path): Directory containing the results. Needs to be parent over category folders.
+            merge_assays (bool): Merge similar assays (rna-seq x2, wgbs x2)
+            exclude_categories (List[str]): Task categories to exclude (first level directory names).
+            exclude_names (List[str]): Names of folders to exclude (ex: 7c or no-mix).
+            return_type (str): Type of data to return ('metrics', 'split_results', 'both').
+            mislabel_corrections (Tuple[Dict[str, str], Dict[str, Dict[str, str]]]): ({md5sum: EpiRR_no-v},{label_category: {EpiRR_no-v: corrected_label}})
+            verbose (bool): Print additional information.
+
+        Returns:
+            Union[Dict[str, Dict[str, Dict[str, float]]],
+                Dict[str, Dict[str, pd.DataFrame]],
+                Tuple[Dict[str, Dict[str, Dict[str, float]]], Dict[str, Dict[str, pd.DataFrame]]]]
+                Depending on return_type, it returns:
+                - 'metrics': A metrics dictionary with the structure {split_name: {task_name: metrics_dict}}
+                - 'split_results': A split results dictionary with the structure {task_name: {split_name: split_results_df}}
+                - 'both': A tuple with both dictionaries described above
+        """
+        if return_type not in ["metrics", "split_results", "both"]:
+            raise ValueError(
+                f"Invalid return_type: {return_type}. Choose from 'metrics', 'split_results', or 'both'."
+            )
+
+        all_split_results = {}
+        split_results_handler = SplitResultsHandler()
+
+        if mislabel_corrections:
+            md5sum_to_epirr, epirr_to_corrections = mislabel_corrections
+        else:
+            md5sum_to_epirr = {}
+            epirr_to_corrections = {}
+
+        for parent, _, _ in os.walk(results_dir):
+            # Looking for oversampling only results
+            parent = Path(parent)
+            if parent.name != "10fold-oversampling":
+                continue
+
+            if verbose:
+                print(f"Checking {parent}")
+
+            # Get the category
+            relpath = parent.relative_to(results_dir)
+            category = relpath.parts[0].rstrip("_1l_3000n")
+            if exclude_categories is not None:
+                if any(exclude_str in category for exclude_str in exclude_categories):
+                    continue
+
+            # Get the rest of the name, ignore certain runs
+            rest_of_name = list(relpath.parts[1:])
+            rest_of_name.remove("10fold-oversampling")
+
+            if len(rest_of_name) > 1:
+                raise ValueError(
+                    f"Too many parts in the name: {rest_of_name}. Path: {relpath}"
+                )
+            if rest_of_name:
+                rest_of_name = rest_of_name[0]
+
+            if exclude_names is not None:
+                if any(name in rest_of_name for name in exclude_names):
+                    if verbose:
+                        print(f"Skipping {category} {rest_of_name}: in {exclude_names}")
+                    continue
+
+            full_task_name = category
+            if rest_of_name:
+                full_task_name += f"_{rest_of_name}"
+
+            # Get the split results
+            split_results = split_results_handler.read_split_results(parent)
+            if not split_results:
+                raise ValueError(f"No split results found in {parent}")
+
+            if (
+                ("sex" in full_task_name) or ("life_stage" in full_task_name)
+            ) and mislabel_corrections:
+                corrections = epirr_to_corrections[category]
+                for split_name, results_df in list(split_results.items()):
+                    current_true_class = results_df["True class"].to_dict()
+                    new_true_class = {
+                        k: corrections.get(md5sum_to_epirr[k], v)
+                        for k, v in current_true_class.items()
+                    }
+                    results_df["True class"] = new_true_class.values()
+
+                    split_results[split_name] = results_df
+
+            if ("assay" in full_task_name) and merge_assays:
+                for split_name, df in split_results.items():
+                    try:
+                        split_result_df = merge_similar_assays(df)
+                    except ValueError as e:
+                        print(f"Skipping {full_task_name} assay merging: {e}")
+                        break
+                    split_results[split_name] = split_result_df
+
+            all_split_results[full_task_name] = split_results
+
+        if return_type in ["metrics", "both"]:
+            try:
+                split_results_metrics = split_results_handler.compute_split_metrics(
+                    all_split_results, concat_first_level=True
+                )
+            except KeyError as e:
+                logging.error("KeyError: %s", e)
+                logging.error("all_split_results: %s", all_split_results)
+                logging.error("check folder: %s", results_dir)
+                raise e
+
+        if return_type == "metrics":
+            return split_results_metrics
+        if return_type == "split_results":
+            return all_split_results
+
+        # the default return type is 'both'
+        return split_results_metrics, all_split_results
+
+
+def create_mislabel_corrector(
+    paper_dir: Path,
+) -> Tuple[Dict[str, str], Dict[str, Dict[str, str]]]:
+    """Obtain information necessary to correct sex and life_stage mislabels.
+
+    Returns:
+        Dict[str, str]: {md5sum: EpiRR_no-v}
+        Dict[str, Dict[str, str]]: {label_category: {EpiRR_no-v: corrected_label}}
+    """
+    epirr_no_v = "EpiRR_no-v"
+    # Associate epirrs to md5sums
+    metadata = MetadataHandler(paper_dir).load_metadata("v2")
+    metadata_df = pd.DataFrame.from_records(list(metadata.datasets))
+    md5sum_to_epirr = metadata_df.set_index("md5sum")[epirr_no_v].to_dict()
+
+    # Load mislabels
+    epirr_to_corrections = {}
+    metadata_dir = paper_dir / "data" / "metadata" / "official" / "BadQual-mislabels"
+
+    sex_mislabeled = pd.read_csv(metadata_dir / "official_Sex_mislabeled.csv")
+    epirr_to_corrections[SEX] = sex_mislabeled.set_index(epirr_no_v)[
+        "EpiClass_pred_Sex"
+    ].to_dict()
+
+    life_stage_mislabeled = pd.read_csv(
+        metadata_dir / "official_Life_stage_mislabeled.csv"
+    )
+    epirr_to_corrections[LIFE_STAGE] = life_stage_mislabeled.set_index(epirr_no_v)[
+        "EpiClass_pred_Life_stage"
+    ].to_dict()
+
+    return md5sum_to_epirr, epirr_to_corrections
 
 
 def extract_data_from_files(
